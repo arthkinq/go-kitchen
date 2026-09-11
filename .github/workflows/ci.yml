@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # The integration suite talks to a real PostgreSQL on purpose - a double that pretends to roll
+    # back proves nothing. Same image as docker-compose.yml, so CI and the local stand agree.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: go_kitchen
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d go_kitchen"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-ed:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # .golangci.yml is in the v2 format, so the action major has to be one that installs
+      # golangci-lint v2 - the v6 line installs v1, which cannot read this config and is built
+      # with an older Go than go.mod targets. The version is pinned so CI lints with the same
+      # binary as the developer machine instead of drifting with "latest".
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+
+      # The migrations are applied the same way docker-compose does it: in mount order, so every
+      # schema migration lands before the demo seed.
+      - name: Apply migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in migrations/000001_init.up.sql \
+                   migrations/000002_partner_auth_and_audit.up.sql \
+                   migrations/000004_restaurant_search_index.up.sql \
+                   migrations/000005_menu_item_search_index.up.sql \
+                   migrations/000006_text_length_limits.up.sql \
+                   migrations/000007_uuid_v7.up.sql \
+                   migrations/000003_demo_seed.up.sql; do
+            echo "applying $f"
+            psql -h localhost -U postgres -d go_kitchen -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      # Not `make test-integration`: that target starts its own PostgreSQL through docker compose,
+      # which would fight the service container above for port 5432. Postgres is already here, so
+      # the whole suite runs in one command. cgo is available on the runner, hence -race.
+      - name: Tests
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/go_kitchen?sslmode=disable
+        run: go test -race -count=1 ./...
+
+      # Version pinned on purpose: with @latest a new release of the linter turns a green
+      # repository red without a single commit, and that is exactly what happened once.
+      - name: OpenAPI lint
+        run: npx --yes @redocly/cli@2.49.0 lint api/openapi.yaml

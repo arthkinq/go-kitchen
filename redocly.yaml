@@ -1,0 +1,16 @@
+apis:
+  kitchen@v1:
+    root: api/openapi.yaml
+
+extends:
+  - recommended
+
+rules:
+  security-defined: off
+
+  no-server-example.com: off
+
+  operation-4xx-response: warn
+
+  operation-operationId: error
+  operation-summary: error

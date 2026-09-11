@@ -1,0 +1,112 @@
+' Два блока: карта пути (CJM) и детальный поток вызовов под ней.
+' PlantUML сгенерирует из файла две диаграммы.
+
+@startuml CJM_Restaurant_Map
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam noteBackgroundColor #FFFFFF
+skinparam noteBorderColor #43A047
+
+title Restaurant Journey Map — Заведение (Go.Kitchen)
+
+note as CJM
+|= |= 1. Подключение |= 2. Наполнение меню |= 3. Ожидание заказов |= 4. Приём заказа |= 5. Готовка |= 6. Форс-мажор |
+|= Действие | Регистрируется на площадке | Заводит категории и блюда | POS-терминал ждёт событий | Печатает чек, подтверждает | Двигает статусы до выдачи | Кончились ингредиенты |
+|= Точка контакта | POST /partner/restaurants | POST /partner/../items | POST /webhook (входящий) | PATCH /partner/orders/{id}/status | PATCH ../status | PATCH /partner/items/{id} |
+|= Мысль | «Кто ещё увидит мои данные?» | «Почему блюдо не видно клиентам?» | «Точно ли до меня дойдёт заказ?» | «А если нажму не туда?» | «Клиент видит, что происходит?» | «Как быстро убрать позицию?» |
+|= Барьер | Открытый API — конкурент правит моё меню | Забыл флаг доступности, блюдо пропало | Один сбой сети, и заказ потерян | Можно перескочить стадию | Клиент не понимает задержку | Заказ уже оформлен |
+|= <b>Как закрыто</b> | Регистрация по bootstrap-токену, дальше API-ключ; чужие ресурсы отвечают 404 | is_available по умолчанию true | Симулятор повторяет 5xx и не повторяет 4xx | State machine отклоняет пропуск стадии с 422 | Каждый шаг пишется в аудит с актором | Стоп-лист убирает из меню, отмена возвращает остатки |
+|= Эмоция | настороженность | растерянность | тревога | осторожность | контроль | управляемость |
+end note
+@enduml
+
+@startuml CJM_Restaurant_Flow
+skinparam monochrome false
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam ActivityBackgroundColor #F9F9F9
+skinparam ActivityBorderColor #43A047
+skinparam ActivityDiamondBorderColor #43A047
+
+title Детальный поток заведения (к CJM выше)
+
+|Менеджер / Шеф-повар Ресторана|
+start
+:Регистрация заведения;
+:POST /api/v1/partner/restaurants
+с заголовком X-Bootstrap-Token;
+
+|API Go.Kitchen|
+:Проверка bootstrap-токена площадки
+(сравнение за постоянное время, иначе 401);
+:Валидация webhook_url (схема + запрет внутренних литеральных адресов);
+:Выдача API-ключа — единственный ответ, где он возвращается;
+
+|Менеджер / Шеф-повар Ресторана|
+:Сохраняет ключ, дальше шлёт Authorization: Bearer <key>;
+:POST .../categories и .../items;
+note right
+  Все запросы ниже проходят
+  проверку владения:
+  чужая категория, блюдо или заказ
+  отвечают 404, а не 403 —
+  идентификаторы конкурентов
+  по API не перебираются
+end note
+
+if (Закончились ингредиенты?) then (да)
+    :PATCH /api/v1/partner/items/{item_id} (is_available = false);
+    |API Go.Kitchen|
+    :Блюдо исчезает из клиентского меню;
+endif
+
+|Симулятор / POS-терминал Ресторана|
+:Ожидание входящих заказов;
+
+|API Go.Kitchen|
+:Покупатель оформил заказ;
+:POST /webhook (order.created);
+
+|Симулятор / POS-терминал Ресторана|
+:Приём вебхука, разбор состава чека;
+:200 OK (acknowledged);
+:Печать чека на кухне;
+
+|Менеджер / Шеф-повар Ресторана|
+:PATCH .../status = accepted;
+
+|API Go.Kitchen|
+if (Переход разрешён state machine?) then (нет)
+    :422 INVALID_STATUS_TRANSITION;
+    |Симулятор / POS-терминал Ресторана|
+    :Постоянный отказ — повтор не поможет, останавливаемся;
+    note right
+      4xx считается окончательным.
+      Сетевые сбои и 5xx повторяются
+      до трёх раз с нарастающей паузой,
+      поэтому один флаки-ответ
+      больше не оставляет заказ висеть.
+    end note
+    stop
+else (да)
+endif
+:Аудит: from -> to, actor = restaurant, комментарий;
+
+|Менеджер / Шеф-повар Ресторана|
+:PATCH .../status = cooking;
+
+if (Форс-мажор на кухне?) then (да)
+    :PATCH .../status = cancelled с причиной;
+    |API Go.Kitchen|
+    :Разрешено только из created / accepted / cooking;
+    :Возврат остатков на склад, аудит с actor = restaurant;
+    stop
+else (нет)
+endif
+
+|Менеджер / Шеф-повар Ресторана|
+:PATCH .../status = ready;
+:PATCH .../status = delivering;
+:PATCH .../status = completed;
+stop
+@enduml

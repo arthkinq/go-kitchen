@@ -1,0 +1,57 @@
+@startuml C4_Component
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Model - Level 3: Component Diagram (kitchen-service)
+
+Container_Boundary(kitchen_service_boundary, "kitchen-service") {
+    Component(router, "HTTP Router & Middlewares", "go-chi/chi/v5", "Маршрутизация, RequestID, StructuredLogger (slog), Recoverer, Timeout, CORS, MaxBytesReader")
+    
+    Component(partner_auth, "Partner Auth Middleware", "internal/handler/http", "Превращает Bearer API-ключ в идентичность заведения; закрывает весь /partner кроме регистрации")
+
+    Component(client_handler, "Client Handler", "internal/handler/http", "Обработка клиентских запросов: каталог и поиск блюд, меню, оформление, отмена и история заказов")
+    Component(partner_handler, "Partner Handler", "internal/handler/http", "Обработка партнерских запросов: CRUD меню, стоп-листы, очередь кухни, смена статусов")
+    
+    Component(order_service, "Order Service", "internal/service", "Бизнес-логика заказов: атомарный чекаут, детерминированные блокировки, возврат остатков, аудит с актором")
+    Component(menu_service, "Menu Service", "internal/service", "Бизнес-логика меню: группировка вложенного меню, стоп-лист, проверка владения категорией и блюдом")
+    Component(restaurant_service, "Restaurant Service", "internal/service", "Бизнес-логика заведений: регистрация с выдачей API-ключа, разрешение ключа, настройки и вебхуки")
+    Component(webhook_dispatcher, "Webhook Dispatcher", "internal/service", "Асинхронная доставка вебхуков с Keep-Alive и изоляцией контекста")
+
+    Component(tx_manager, "Transaction Manager", "internal/repository/postgres", "Управление ACID-транзакциями через context propagation в pgxpool")
+    Component(order_repo, "Order Repository", "internal/repository/postgres", "SQL-запросы к orders, order_items и order_status_history")
+    Component(menu_repo, "Menu Repository", "internal/repository/postgres", "SQL-запросы к menu_categories, menu_items, атомарный декремент/инкремент остатков")
+    Component(restaurant_repo, "Restaurant Repository", "internal/repository/postgres", "SQL-запросы к restaurants")
+}
+
+ContainerDb(postgres_db, "PostgreSQL Database", "PostgreSQL 17", "Хранение данных")
+Container(partner_simulator, "Partner Restaurant", "HTTP Server", "Прием вебхуков на порту 8081")
+
+Rel(router, client_handler, "Маршрутизирует клиентские запросы")
+Rel(router, partner_auth, "Пропускает /api/v1/partner через проверку ключа")
+Rel(partner_auth, restaurant_service, "GetByAPIKey -> restaurant_id в контексте")
+Rel(partner_auth, partner_handler, "Передает запрос с идентичностью заведения")
+
+Rel(client_handler, order_service, "Вызовы методов заказов")
+Rel(client_handler, menu_service, "Вызовы методов меню")
+Rel(client_handler, restaurant_service, "Вызовы методов ресторанов")
+
+Rel(partner_handler, order_service, "Обновление статусов")
+Rel(partner_handler, menu_service, "Управление позициями")
+Rel(partner_handler, restaurant_service, "Управление заведением")
+
+Rel(order_service, webhook_dispatcher, "События order.created / order.status_updated / order.cancelled")
+Rel(webhook_dispatcher, partner_simulator, "POST /webhook", "JSON / HTTP")
+
+Rel(order_service, tx_manager, "WithinTransaction")
+Rel(order_service, order_repo, "CRUD заказов")
+Rel(order_service, menu_repo, "Блокировки и списание остатков")
+Rel(order_service, restaurant_repo, "Проверка активности заведения")
+
+Rel(menu_service, menu_repo, "CRUD категорий и блюд")
+Rel(restaurant_service, restaurant_repo, "CRUD ресторанов")
+
+Rel(order_repo, postgres_db, "SQL / pgxpool")
+Rel(menu_repo, postgres_db, "SQL / pgxpool")
+Rel(restaurant_repo, postgres_db, "SQL / pgxpool")
+@enduml

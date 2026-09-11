@@ -1,0 +1,128 @@
+' Два блока: карта пути (CJM) и детальный поток вызовов под ней.
+' PlantUML сгенерирует из файла две диаграммы.
+
+@startuml CJM_Customer_Map
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam noteBackgroundColor #FFFFFF
+skinparam noteBorderColor #1E88E5
+
+title Customer Journey Map — Покупатель (Go.Kitchen)
+
+note as CJM
+|= |= 1. Захотел поесть |= 2. Ищет еду |= 3. Выбирает блюда |= 4. Оформляет заказ |= 5. Ждёт |= 6. Получил |
+|= Действие | Открывает раздел Go.Kitchen | Ищет заведение или сразу блюдо | Открывает меню, набирает корзину | Указывает адрес, подтверждает | Следит за статусом и историей заказов | Забирает у курьера |
+|= Точка контакта | Web-клиент | GET /restaurants?search= и GET /items?search= | GET /restaurants/{id}/menu | POST /orders | GET /orders/{id}?user_id= и GET /orders?user_id= | — |
+|= Мысль | «Что тут вообще есть?» | «Где найти именно шаурму?» | «Это точно есть в наличии?» | «А если сразу передумаю?» | «Когда приедет?» | «Всё ли привезли?» |
+|= Барьер | Каталог ни о чём не говорит | Название заведения не говорит о блюде: шаурма может быть в меню «Вкусно и точка» | Блюдо в стоп-листе или закончилось | Передумал сразу после нажатия | Непонятно, что происходит на кухне | — |
+|= <b>Как закрыто</b> | Отдаются только активные заведения | Поиск отдельно по заведениям и по блюдам, по названию и описанию — вплоть до ингредиента | Меню отдаёт только доступное, остаток виден | Отмена, пока статус created, с возвратом остатков | status_history с актором, плюс история своих заказов | Чек со снимком цен в order_items |
+|= Эмоция | нейтрально | находит блюдо, а не только вывеску | тревога из-за наличия | напряжение | спокойствие, статус виден | удовлетворение |
+end note
+@enduml
+
+@startuml CJM_Customer_Flow
+skinparam monochrome false
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam ActivityBackgroundColor #F9F9F9
+skinparam ActivityBorderColor #1E88E5
+skinparam ActivityDiamondBorderColor #1E88E5
+
+title Детальный поток покупателя (к CJM выше)
+
+|Пользователь (Web-клиент)|
+start
+:Открытие раздела "Go.Kitchen";
+
+|API Go.Kitchen|
+:GET /api/v1/restaurants?search=...&limit=...;
+:Только is_active = true, поиск по названию и описанию;
+note right
+  limit вне диапазона 1..100 и
+  нечисловой limit отклоняются с 400,
+  а не подменяются молча
+end note
+
+|Пользователь (Web-клиент)|
+:Просмотр каталога, выбор заведения;
+
+|API Go.Kitchen|
+:GET /api/v1/items?search=... — поиск самого блюда;
+:Только доступные блюда активных заведений, вместе с названием заведения;
+note right
+  Прямой ответ на вопрос ТЗ «как человек находит товар»:
+  «шаурма» находит блюдо в чужом меню, а не только
+  заведение с этим словом в названии.
+  Поиск идёт и по описанию, поэтому работает
+  и запрос по ингредиенту.
+end note
+
+|API Go.Kitchen|
+:GET /api/v1/restaurants/{id}/menu;
+if (Заведение существует?) then (нет)
+    :404 NOT_FOUND;
+    |Пользователь (Web-клиент)|
+    :"Заведение больше не работает";
+    stop
+else (да)
+endif
+:Категории с блюдами, только is_available = true;
+
+|Пользователь (Web-клиент)|
+:Набор корзины, адрес доставки, комментарий;
+:Нажатие "Оформить заказ";
+
+|API Go.Kitchen|
+:POST /api/v1/orders;
+partition "Атомарный чекаут (одна транзакция)" {
+    :Проверка активности заведения внутри транзакции;
+    :SELECT ... FOR UPDATE по возрастанию id (защита от дедлоков);
+    if (Остатков достаточно и блюда доступны?) then (да)
+        :UPDATE stock_quantity ... WHERE stock_quantity >= N;
+        :Снимок цен в order_items;
+        :Заказ в статусе created + запись аудита (actor = system);
+        :COMMIT;
+    else (нет)
+        :ROLLBACK — списанные остатки возвращаются;
+        :409 OUT_OF_STOCK / 422 ITEM_UNAVAILABLE;
+        |Пользователь (Web-клиент)|
+        :"Блюдо закончилось, выберите другое";
+        stop
+    endif
+}
+:Асинхронный вебхук ресторану (order.created);
+
+|Пользователь (Web-клиент)|
+:Номер заказа и чек;
+:Отслеживание статуса GET /api/v1/orders/{id}?user_id=...;
+:История своих заказов GET /api/v1/orders?user_id=...;
+
+if (Хочет отменить?) then (да)
+    |API Go.Kitchen|
+    :POST /api/v1/orders/{id}/cancel;
+    if (Заказ принадлежит этому user_id?) then (нет)
+        :404 NOT_FOUND — существование чужого заказа не раскрывается;
+        stop
+    else (да)
+    endif
+    if (Статус = created?) then (да)
+        :Возврат остатков, статус cancelled, аудит (actor = customer);
+        |Пользователь (Web-клиент)|
+        :"Заказ отменён";
+        stop
+    else (нет, кухня уже взялась)
+        |API Go.Kitchen|
+        :422 ORDER_ALREADY_PROCESSED;
+        |Пользователь (Web-клиент)|
+        :"Заказ уже готовится, отмена невозможна";
+    endif
+endif
+
+|API Go.Kitchen|
+:Ресторан двигает статус: accepted -> cooking -> ready -> delivering -> completed;
+:Каждый переход пишется в аудит с actor = restaurant;
+
+|Пользователь (Web-клиент)|
+:Курьер доставил заказ, статус completed;
+stop
+@enduml

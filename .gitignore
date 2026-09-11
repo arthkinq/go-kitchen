@@ -1,0 +1,33 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/kitchen-service
+/partner-restaurant
+
+# Test artifacts
+*.out
+*.test
+coverage.html
+coverage.txt
+
+# Generated diagrams: the README render command fills this directory, the .puml sources are
+# what the repository tracks.
+docs/diagrams/out/
+
+# Environment & local secrets
+.env
+.env.local
+*.local
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

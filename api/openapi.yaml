@@ -1,0 +1,1317 @@
+openapi: 3.0.3
+info:
+  title: Go.Kitchen API (Go.Kitchen Service)
+  description: |
+    REST API сервиса доставки еды «Go.Kitchen».
+    Предоставляет интерфейсы для покупателей (каталог заведений, меню, оформление заказов, отслеживание и отмена),
+    а также для ресторанов-партнеров (управление меню, стоп-лист, остатки, очередь заказов, изменение статусов готовки и вебхуки).
+  version: 1.0.0
+  contact:
+    name: Go.Kitchen Core Team
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Основной сервис Go.Kitchen (Core Kitchen Service)
+  - url: http://localhost:8081
+    description: Демо-сервис ресторана-партнера (Partner Restaurant Simulator)
+
+tags:
+  - name: Client API
+    description: Эндпоинты для клиентской Web-части (покупатели)
+  - name: Partner API
+    description: Эндпоинты для ресторанов-партнеров (закрытый доступ)
+  - name: Partner Simulator
+    description: Эндпоинты демо-сервиса ресторана (прием вебхуков и история событий)
+  - name: Health
+    description: Проверка работоспособности сервисов
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags:
+        - Health
+      summary: Проверка жизнеспособности сервиса (Health check)
+      responses:
+        '200':
+          description: Сервис работает нормально
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+    head:
+      operationId: healthCheckHead
+      tags:
+        - Health
+      summary: То же самое без тела ответа
+      description: Отдельно объявлен потому, что healthcheck в `docker-compose.yml` ходит через `wget --spider`, а это HEAD-запрос. Без этого маршрута compose получал бы `405` и считал сервис нездоровым.
+      responses:
+        '200':
+          description: Сервис работает нормально
+
+  /api/v1/restaurants:
+    get:
+      operationId: listRestaurants
+      tags:
+        - Client API
+      summary: Получить каталог доступных ресторанов
+      description: |
+        Возвращает список только активных заведений, готовых принимать заказы.
+        Параметр `search` отвечает на вопрос «как человек находит нужное заведение»:
+        регистронезависимый поиск подстроки по названию и описанию.
+      parameters:
+        - name: search
+          in: query
+          description: |
+            Подстрока названия или описания заведения (регистронезависимо).
+            Минимум 3 символа: более короткий паттерн не покрывается триграммным индексом
+            и выродился бы в полное сканирование каталога, поэтому отклоняется с 400.
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 100
+          example: пицц
+        - name: limit
+          in: query
+          description: Количество записей на странице. Значение вне диапазона отклоняется с 400.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          description: Смещение выборки для пагинации
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Список ресторанов успешно получен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Restaurant'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /api/v1/restaurants/{restaurant_id}:
+    get:
+      operationId: getRestaurant
+      tags:
+        - Client API
+      summary: Получить информацию о ресторане по ID
+      parameters:
+        - name: restaurant_id
+          in: path
+          required: true
+          description: UUID заведения
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Информация о заведении
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Restaurant'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/restaurants/{restaurant_id}/menu:
+    get:
+      operationId: getRestaurantMenu
+      tags:
+        - Client API
+      summary: Получить полное меню ресторана
+      description: Возвращает список категорий меню со вложенными доступными блюдами (`is_available = true`).
+      parameters:
+        - name: restaurant_id
+          in: path
+          required: true
+          description: UUID заведения
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Полное меню ресторана
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MenuCategoryWithItems'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/items:
+    get:
+      operationId: searchMenuItems
+      tags:
+        - Client API
+      summary: Поиск блюд по всей площадке
+      description: |
+        Ответ на вопрос ТЗ «как человек находит товар». Поиск по каталогу отвечает лишь на половину:
+        он матчит название заведения, поэтому «шаурма» не найдёт шаурму в чужом меню. Здесь ищется
+        само блюдо — по названию и по описанию, так что работает и поиск по ингредиенту
+        («моцарелла» находит и «Маргариту», и «Пепперони»).
+
+        Отдаются только те блюда, которые реально можно заказать: доступные позиции активных
+        заведений. В отличие от каталога параметр `search` обязателен — за глобальным списком всех
+        блюд площадки нет индекса, и это ровно тот полный скан, ради которого введена минимальная
+        длина запроса.
+      parameters:
+        - name: search
+          in: query
+          required: true
+          description: От 3 до 100 символов. `%` и `_` ищутся как обычные символы, а не как шаблон.
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 100
+          example: "шаурма"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Найденные блюда вместе с заведениями, которые их продают
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MenuItemSearchResult'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /api/v1/orders:
+    get:
+      operationId: listMyOrders
+      tags:
+        - Client API
+      summary: История заказов покупателя
+      description: |
+        Аутентификация пользователей вне скоупа задания, поэтому покупатель называет себя сам
+        в `user_id`, и параметр обязателен: без него ручка отдавала бы все заказы системы,
+        а не историю одного человека. Запрос ложится на индекс `idx_orders_user_id`.
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          description: Фильтр по статусу заказа
+          schema:
+            type: string
+            enum: [created, accepted, cooking, ready, delivering, completed, cancelled]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Заказы покупателя, новые первыми
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+    post:
+      operationId: createOrder
+      tags:
+        - Client API
+      summary: Оформить новый заказ
+      description: |
+        Атомарно проверяет активность заведения, блокирует позиции в БД, проверяет остатки,
+        списывает их со склада, фиксирует моментальный снимок цен и отправляет вебхук партнеру.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Заказ успешно создан и передан в ресторан
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Недостаточно остатков на складе ресторана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: "OUT_OF_STOCK"
+                  message: "one or more items are out of stock"
+        '422':
+          description: Ресторан неактивен, блюдо недоступно или блюда из разных заведений
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/orders/{order_id}:
+    get:
+      operationId: getOrder
+      tags:
+        - Client API
+      summary: Получить информацию о заказе (чек и статус)
+      description: Карточка заказа содержит адрес доставки, комментарий и чек, поэтому покупатель называет себя параметром `user_id` — так же, как в истории заказов. Чужой заказ отвечает `404`, а не `403`, — по идентификатору нельзя проверить, что заказ существует.
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          description: UUID заказа
+          schema:
+            type: string
+            format: uuid
+        - name: user_id
+          in: query
+          required: true
+          description: UUID покупателя, оформившего заказ (заглушка вместо аутентификации)
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Детали заказа и текущий статус
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      operationId: cancelOrder
+      tags:
+        - Client API
+      summary: Отменить заказ покупателем
+      description: Покупатель может отменить заказ только до того, как кухня начала приготовление (`status = created`). При отмене остатки автоматически возвращаются на склад.
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          description: UUID заказа
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+      responses:
+        '200':
+          description: Заказ успешно отменен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          description: Заказ уже передан на кухню или готовится и не может быть отменен покупателем
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/partner/restaurants:
+    post:
+      operationId: registerRestaurant
+      security:
+        - AdminBootstrapToken: []
+      tags:
+        - Partner API
+      summary: Зарегистрировать новое заведение
+      description: |
+        Закрыта bootstrap-токеном: по ТЗ доступ к площадке открыт «некоторому списку заведений»,
+        а регистрация — это то, что помещает заведение в этот список. Токен выдаёт площадка вне
+        полосы. Если он не сконфигурирован, ручка отвечает `401`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRestaurantRequest'
+      responses:
+        '201':
+          description: Заведение успешно зарегистрировано
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RegisteredRestaurant'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/partner/restaurants/{restaurant_id}:
+    patch:
+      operationId: updateRestaurant
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Обновить параметры ресторана (активность, адрес, webhook_url)
+      parameters:
+        - name: restaurant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRestaurantRequest'
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '200':
+          description: Параметры заведения обновлены
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Restaurant'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/partner/restaurants/{restaurant_id}/categories:
+    post:
+      operationId: createMenuCategory
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Добавить категорию в меню ресторана
+      parameters:
+        - name: restaurant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMenuCategoryRequest'
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '201':
+          description: Категория создана
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MenuCategory'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /api/v1/partner/categories/{category_id}:
+    patch:
+      operationId: updateMenuCategory
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Изменить категорию меню
+      parameters:
+        - name: category_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMenuCategoryRequest'
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '200':
+          description: Категория обновлена
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MenuCategory'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+    delete:
+      operationId: deleteMenuCategory
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Удалить категорию меню
+      parameters:
+        - name: category_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '204':
+          description: Категория удалена, тело ответа отсутствует
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /api/v1/partner/restaurants/{restaurant_id}/items:
+    post:
+      operationId: createMenuItem
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Добавить блюдо в меню
+      parameters:
+        - name: restaurant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMenuItemRequest'
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '201':
+          description: Блюдо успешно добавлено в меню
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MenuItem'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/partner/items/{item_id}:
+    patch:
+      operationId: updateMenuItem
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Обновить параметры блюда (цена, остатки, стоп-лист)
+      description: Позволяет ресторану оперативно изменять цену, пополнять остатки или снимать блюдо с продажи (`is_available = false`).
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMenuItemRequest'
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '200':
+          description: Блюдо обновлено
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MenuItem'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    delete:
+      operationId: deleteMenuItem
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Удалить блюдо из меню
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '204':
+          description: Блюдо удалено, тело ответа отсутствует
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /api/v1/partner/restaurants/{restaurant_id}/orders:
+    get:
+      operationId: listRestaurantOrders
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Получить очередь заказов заведения
+      parameters:
+        - name: restaurant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          description: Фильтр по статусу заказа
+          schema:
+            type: string
+            enum: [created, accepted, cooking, ready, delivering, completed, cancelled]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '200':
+          description: Список заказов заведения
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/partner/orders/{order_id}/status:
+    patch:
+      operationId: updateOrderStatus
+      security:
+        - PartnerApiKey: []
+      tags:
+        - Partner API
+      summary: Изменить статус заказа (жизненный цикл на кухне)
+      description: |
+        Переводит заказ по стейт-машине:
+        `accepted` (принят) -> `cooking` (готовится) -> `ready` (готов) -> `delivering` (передан курьеру) -> `completed` (выдан).
+        Если статус меняется на `cancelled`, остатки автоматически возвращаются на склад.
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderStatusRequest'
+      responses:
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '200':
+          description: Статус заказа успешно изменен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          description: Недопустимый переход статуса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webhook:
+    servers:
+      - url: http://localhost:8081
+        description: Демо-сервис ресторана-партнера (Partner Restaurant Simulator)
+    post:
+      operationId: receiveWebhook
+      tags:
+        - Partner Simulator
+      summary: Прием входящих вебхуков от Авито.Кухни (симулятор партнера)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '200':
+          description: Вебхук принят и обработан
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "acknowledged"
+        '400':
+          description: Тело запроса не разобрано как JSON
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "invalid payload"
+
+  /events:
+    servers:
+      - url: http://localhost:8081
+        description: Демо-сервис ресторана-партнера (Partner Restaurant Simulator)
+    get:
+      operationId: listWebhookEvents
+      tags:
+        - Partner Simulator
+      summary: Получить историю полученных вебхуков
+      responses:
+        '200':
+          description: Список последних полученных вебхуков
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookPayload'
+
+components:
+  securitySchemes:
+    AdminBootstrapToken:
+      type: apiKey
+      in: header
+      name: X-Bootstrap-Token
+      description: |
+        Токен площадки, разрешающий поставить новое заведение на учёт. Отдельный от партнёрского
+        ключа: тот отвечает на вопрос «какое я заведение», этот — «можно ли добавить ещё одно».
+        В стенде `docker compose` задан как `demo-bootstrap-token-000000000001`.
+    PartnerApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Закрытый доступ для заведений. Ключ выдаётся один раз при регистрации
+        (`POST /api/v1/partner/restaurants`) и определяет, от имени какого заведения
+        выполняется запрос. Чужие категории, блюда и заказы отвечают `404`, чтобы по API
+        нельзя было перебирать идентификаторы конкурентов.
+        Альтернативно ключ принимается в заголовке `X-Api-Key`.
+
+  schemas:
+    Restaurant:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "Додо Пицца"
+        description:
+          type: string
+          example: "Сеть пиццерий №1 в России"
+        address:
+          type: string
+          example: "г. Москва, ул. Ленина, д. 10"
+        is_active:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RegisteredRestaurant:
+      description: |
+        Ответ на регистрацию — единственный, который несёт партнёрские поля.
+        Они не читаются из базы, а возвращаются ровно теми, какими их прислало заведение:
+        публичная проекция `restaurantColumns` их не выбирает вовсе.
+      allOf:
+        - $ref: '#/components/schemas/Restaurant'
+        - type: object
+          properties:
+            api_key:
+              type: string
+              readOnly: true
+              description: Ключ закрытого партнёрского доступа. Выдаётся один раз и больше не возвращается.
+              example: "6f1c1f0f...c9a4"
+            webhook_url:
+              type: string
+              description: Адрес заведения для уведомлений о заказах. Клиентам не показывается.
+              example: "http://partner-restaurant:8081/webhook"
+
+    CreateRestaurantRequest:
+      type: object
+      required:
+        - name
+        - address
+      properties:
+        name:
+          type: string
+          example: "Бургер Кинг"
+        description:
+          type: string
+          maxLength: 1000
+          example: "Вкуснейшие бургеры на гриле"
+        address:
+          type: string
+          example: "г. Москва, ул. Тверская, д. 5"
+        webhook_url:
+          type: string
+          example: "http://partner-restaurant:8081/webhook"
+
+    UpdateRestaurantRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+          maxLength: 1000
+        address:
+          type: string
+        is_active:
+          type: boolean
+        webhook_url:
+          type: string
+
+    MenuCategory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        restaurant_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "Бургеры"
+        sort_order:
+          type: integer
+          example: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    MenuCategoryWithItems:
+      allOf:
+        - $ref: '#/components/schemas/MenuCategory'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/MenuItem'
+
+    MenuItemSearchResult:
+      description: |
+        Блюдо из результатов поиска. Это обычное блюдо плюс одно поле — название заведения:
+        `restaurant_id` уже есть в `MenuItem`, поэтому клиент может сразу открыть меню продавца.
+      allOf:
+        - $ref: '#/components/schemas/MenuItem'
+        - type: object
+          properties:
+            restaurant_name:
+              type: string
+              example: "Пиццерия «Тесто и Огонь»"
+
+    CreateMenuCategoryRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          example: "Напитки"
+        sort_order:
+          type: integer
+          example: 2
+
+    UpdateMenuCategoryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        sort_order:
+          type: integer
+
+    MenuItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        restaurant_id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "Чизбургер"
+        description:
+          type: string
+          example: "Сочная говяжья котлета с сыром чеддер"
+        price_cents:
+          type: integer
+          format: int64
+          description: Цена в копейках/центах (25000 = 250.00 ₽)
+          example: 25000
+        stock_quantity:
+          type: integer
+          description: Количество порций на остатке
+          example: 15
+        is_available:
+          type: boolean
+          description: Флаг доступности для заказа (стоп-лист)
+          example: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateMenuItemRequest:
+      type: object
+      required:
+        - category_id
+        - name
+        - price_cents
+        - stock_quantity
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "Пепперони 30 см"
+        description:
+          type: string
+          maxLength: 1000
+          example: "Пикантная пепперони с сыром моцарелла"
+        price_cents:
+          type: integer
+          format: int64
+          example: 59000
+        stock_quantity:
+          type: integer
+          example: 20
+        is_available:
+          type: boolean
+          default: true
+
+    UpdateMenuItemRequest:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+          maxLength: 1000
+        price_cents:
+          type: integer
+          format: int64
+        stock_quantity:
+          type: integer
+        is_available:
+          type: boolean
+
+    OrderItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+          format: uuid
+        menu_item_id:
+          type: string
+          format: uuid
+        item_name:
+          type: string
+          example: "Чизбургер"
+        price_cents:
+          type: integer
+          format: int64
+          example: 25000
+        quantity:
+          type: integer
+          example: 2
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        restaurant_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [created, accepted, cooking, ready, delivering, completed, cancelled]
+          example: "accepted"
+        total_price_cents:
+          type: integer
+          format: int64
+          example: 50000
+        delivery_address:
+          type: string
+          example: "г. Москва, ул. Арбат, д. 12, кв. 44"
+        comment:
+          type: string
+          example: "Пожалуйста, положите салфетки"
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        status_history:
+          type: array
+          description: Аудит переходов статуса от старых к новым.
+          items:
+            $ref: '#/components/schemas/OrderStatusHistoryEntry'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OrderStatusHistoryEntry:
+      type: object
+      description: "Запись аудита: кто и когда перевёл заказ в новый статус."
+      properties:
+        id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+          format: uuid
+        from_status:
+          type: string
+          description: Пустая строка для самой первой записи (создание заказа).
+          example: "created"
+        to_status:
+          type: string
+          enum: [created, accepted, cooking, ready, delivering, completed, cancelled]
+          example: "accepted"
+        actor:
+          type: string
+          enum: [customer, restaurant, system]
+          description: Инициатор перехода.
+          example: "restaurant"
+        comment:
+          type: string
+          example: "Заказ подтвержден рестораном и передан шеф-повару"
+        created_at:
+          type: string
+          format: date-time
+
+    CreateOrderItemRequest:
+      type: object
+      required:
+        - menu_item_id
+        - quantity
+      properties:
+        menu_item_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          example: 2
+
+    CreateOrderRequest:
+      type: object
+      required:
+        - user_id
+        - restaurant_id
+        - delivery_address
+        - items
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        restaurant_id:
+          type: string
+          format: uuid
+        delivery_address:
+          type: string
+          example: "г. Москва, ул. Ленина, д. 1"
+        comment:
+          type: string
+          maxLength: 1000
+          example: "Оставить у двери"
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CreateOrderItemRequest'
+
+    CancelOrderRequest:
+      type: object
+      required:
+        - user_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          maxLength: 1000
+          example: "Ошибся адресом доставки"
+
+    UpdateOrderStatusRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [accepted, cooking, ready, delivering, completed, cancelled]
+          example: "cooking"
+        comment:
+          type: string
+          maxLength: 1000
+          example: "Повар приступил к сборке бургеров"
+
+    WebhookPayload:
+      type: object
+      properties:
+        event:
+          type: string
+          example: "order.created"
+        timestamp:
+          type: string
+          format: date-time
+        data:
+          type: object
+
+    ErrorDetail:
+      type: object
+      properties:
+        code:
+          type: string
+          example: "NOT_FOUND"
+        message:
+          type: string
+          example: "requested resource not found"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+
+  responses:
+    UnauthorizedError:
+      description: Отсутствует или неверен партнёрский API-ключ
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "UNAUTHORIZED"
+              message: "missing or invalid credentials"
+
+    BadRequestError:
+      description: Некорректный запрос или невалидный синтаксис данных
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "BAD_REQUEST"
+              message: "invalid request data or syntax"
+
+    ConflictError:
+      description: |
+        Запрос конфликтует с уже существующими данными. Приходит на удаление категории, в которой
+        есть блюда, на удаление блюда, попавшего хотя бы в один заказ (в чеке хранится снимок, но
+        ссылка из `order_items` защищена `ON DELETE RESTRICT`), и на категорию с уже занятым именем.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "CONFLICT"
+              message: "resource already exists or conflicts with existing state"
+
+    NotFoundError:
+      description: Запрашиваемый ресурс не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "NOT_FOUND"
+              message: "requested resource not found"

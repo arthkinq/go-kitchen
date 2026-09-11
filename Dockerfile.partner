@@ -1,0 +1,39 @@
+# Stage 1: Build binary
+FROM golang:1.26-alpine AS builder
+ENV GOTOOLCHAIN=auto
+
+WORKDIR /src
+
+# Cache dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY cmd/ cmd/
+COPY internal/ internal/
+
+# Build static executable stripped of debug symbols
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-w -s" \
+    -o /bin/partner-restaurant \
+    ./cmd/partner-restaurant
+
+# Stage 2: Minimal hardened runtime
+FROM alpine:3.21
+
+# Install security certificates, timezone data and wget for healthchecks
+RUN apk add --no-cache ca-certificates tzdata wget && \
+    addgroup -g 10001 -S appgroup && \
+    adduser -u 10001 -S appuser -G appgroup
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /bin/partner-restaurant /app/partner-restaurant
+
+# Use non-root user
+USER appuser:appgroup
+
+EXPOSE 8081
+
+ENTRYPOINT ["/app/partner-restaurant"]

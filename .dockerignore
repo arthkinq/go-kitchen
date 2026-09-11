@@ -1,0 +1,9 @@
+.git
+.gitignore
+bin/
+*.exe
+*.log
+.gemini/
+scratch/
+docs/
+*.md

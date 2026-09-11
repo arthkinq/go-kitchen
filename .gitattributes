@@ -1,0 +1,9 @@
+# Единые окончания строк во всём репозитории.
+# Без этого файла Windows с core.autocrlf=true и macOS/Linux дают разный рабочий каталог,
+# а SQL-миграции монтируются в контейнер Postgres как есть.
+* text=auto eol=lf
+
+# Бинарные форматы не трогаем.
+*.png binary
+*.jpg binary
+*.pdf binary

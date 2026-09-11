@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: go-kitchen-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: go_kitchen
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/000001_init.up.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./migrations/000002_partner_auth_and_audit.up.sql:/docker-entrypoint-initdb.d/02_partner_auth_and_audit.sql:ro
+      - ./migrations/000004_restaurant_search_index.up.sql:/docker-entrypoint-initdb.d/03_restaurant_search_index.sql:ro
+      - ./migrations/000005_menu_item_search_index.up.sql:/docker-entrypoint-initdb.d/04_menu_item_search_index.sql:ro
+      - ./migrations/000006_text_length_limits.up.sql:/docker-entrypoint-initdb.d/05_text_length_limits.sql:ro
+      - ./migrations/000007_uuid_v7.up.sql:/docker-entrypoint-initdb.d/06_uuid_v7.sql:ro
+      - ./migrations/000003_demo_seed.up.sql:/docker-entrypoint-initdb.d/07_demo_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d go_kitchen"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+    networks:
+      - kitchen-net
+
+  kitchen-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.kitchen
+    container_name: go-kitchen-service
+    environment:
+      PORT: "8080"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/go_kitchen?sslmode=disable"
+      LOG_LEVEL: "info"
+      READ_TIMEOUT: "15s"
+      WRITE_TIMEOUT: "15s"
+      IDLE_TIMEOUT: "60s"
+      SHUTDOWN_TIMEOUT: "10s"
+      WEBHOOK_TIMEOUT: "5s"
+      WEBHOOK_MAX_INFLIGHT: "256"
+      ADMIN_BOOTSTRAP_TOKEN: "demo-bootstrap-token-000000000001"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    restart: unless-stopped
+    networks:
+      - kitchen-net
+
+  partner-restaurant:
+    build:
+      context: .
+      dockerfile: Dockerfile.partner
+    container_name: go-kitchen-partner
+    environment:
+      PORT: "8081"
+      KITCHEN_API_URL: "http://kitchen-service:8080"
+      PARTNER_API_KEY: "demo-partner-key-0000000000000000001"
+      AUTO_COOK: "true"
+      STEP_INTERVAL: "1500ms"
+    ports:
+      - "8081:8081"
+    depends_on:
+      kitchen-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    restart: unless-stopped
+    networks:
+      - kitchen-net
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  kitchen-net:
+    driver: bridge

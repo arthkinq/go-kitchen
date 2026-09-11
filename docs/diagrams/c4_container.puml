@@ -1,0 +1,29 @@
+@startuml C4_Container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Model - Level 2: Container Diagram (Go.Kitchen)
+
+Person(customer, "Покупатель", "Пользователь площадки Авито, заказывающий готовую еду")
+Person(partner_staff, "Персонал Ресторана", "Менеджер кухни, шеф-повар или оператор заведения")
+
+System_Boundary(go_kitchen_boundary, "Система Go.Kitchen") {
+    Container(web_client, "Web Client", "TypeScript / React", "Клиентский интерфейс выбора заведений, просмотра меню и чекаута")
+    Container(kitchen_service, "Kitchen Service", "Go 1.26, Chi Router", "Основной микросервис: каталог с поиском, меню, атомарный чекаут, остатки, жизненный цикл заказов и закрытый партнёрский API")
+    ContainerDb(postgres_db, "PostgreSQL Database", "PostgreSQL 17", "Реляционное хранилище данных: рестораны, меню, стоп-листы, заказы, снимки цен и история аудита")
+}
+
+System_Boundary(partner_boundary, "Инфраструктура Партнера-Ресторана") {
+    Container(partner_simulator, "Partner Demo Restaurant", "Go 1.26, Chi Router", "Демо-сервис ресторана: слушает вебхуки order.created и эмулирует кухонный процесс (accepted -> cooking -> ready)")
+}
+
+Rel(customer, web_client, "Просматривает каталог, формирует заказ", "HTTPS")
+Rel(web_client, kitchen_service, "Выполняет REST API запросы", "JSON / HTTP", "Порт 8080")
+Rel(partner_staff, partner_simulator, "Управляет заказами и кухней", "Internal UI / API")
+
+Rel(partner_simulator, kitchen_service, "Обновляет статусы заказов, управляет меню (Bearer API-ключ)", "JSON / HTTP PATCH", "Порт 8080")
+Rel_Back(partner_simulator, kitchen_service, "Отправляет уведомления о заказах (вебхуки)", "JSON / HTTP POST", "Порт 8081")
+
+Rel(kitchen_service, postgres_db, "Чтение/запись с ACID транзакциями и row locking", "pgxpool / SQL", "Порт 5432")
+@enduml

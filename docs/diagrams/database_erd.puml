@@ -1,0 +1,127 @@
+@startuml Database_ERD
+skinparam monochrome false
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+title Схема БД Go.Kitchen (PostgreSQL 17) - соответствует migrations/
+
+entity "restaurants" as restaurants {
+    * id : UUID [PK, UUID v7 из приложения]
+    --
+    * name : VARCHAR(255) (CHECK length(trim) > 0)
+    * description : TEXT (NOT NULL, DEFAULT '')
+    * address : TEXT (CHECK length(trim) > 0)
+    * is_active : BOOLEAN (DEFAULT true)
+    * webhook_url : TEXT (NOT NULL, DEFAULT '')
+    * api_key : TEXT (NOT NULL, DEFAULT '')
+    * created_at : TIMESTAMPTZ (DEFAULT NOW())
+    * updated_at : TIMESTAMPTZ (DEFAULT NOW())
+    --
+    CHECK octet_length(description) <= 1000
+    UNIQUE (api_key) WHERE api_key <> ''
+    INDEX (created_at DESC) WHERE is_active
+    GIN (name gin_trgm_ops)
+    GIN (description gin_trgm_ops)   <- поиск по каталогу
+}
+
+entity "menu_categories" as categories {
+    * id : UUID [PK, UUID v7 из приложения]
+    --
+    * restaurant_id : UUID [FK -> restaurants.id, ON DELETE CASCADE]
+    * name : VARCHAR(255)
+    * sort_order : INT (DEFAULT 0)
+    * created_at : TIMESTAMPTZ
+    * updated_at : TIMESTAMPTZ
+    --
+    UNIQUE (restaurant_id, id)   <- цель составного FK ниже
+    UNIQUE (restaurant_id, name)
+    INDEX (restaurant_id, sort_order)
+}
+
+entity "menu_items" as items {
+    * id : UUID [PK, UUID v7 из приложения]
+    --
+    * restaurant_id : UUID [FK -> restaurants.id, ON DELETE CASCADE]
+    * category_id : UUID
+    * name : VARCHAR(255)
+    * description : TEXT (NOT NULL, DEFAULT '')
+    * price_cents : BIGINT (CHECK >= 0)
+    * stock_quantity : INT (CHECK >= 0)
+    * is_available : BOOLEAN (DEFAULT true)
+    * created_at : TIMESTAMPTZ
+    * updated_at : TIMESTAMPTZ
+    --
+    CHECK octet_length(description) <= 1000
+    FK (restaurant_id, category_id) ->
+       menu_categories(restaurant_id, id) ON DELETE RESTRICT
+    INDEX (restaurant_id, category_id)
+    INDEX (restaurant_id, is_available)
+    GIN (name gin_trgm_ops)
+    GIN (description gin_trgm_ops)   <- поиск блюд по всей площадке
+}
+
+entity "orders" as orders {
+    * id : UUID [PK, UUID v7 из приложения]
+    --
+    * user_id : UUID (без FK: таблицы пользователей нет по ТЗ)
+    * restaurant_id : UUID [FK -> restaurants.id, ON DELETE RESTRICT]
+    * status : VARCHAR(50) (CHECK IN created, accepted, cooking,
+                            ready, delivering, completed, cancelled)
+    * total_price_cents : BIGINT (CHECK >= 0)
+    * delivery_address : TEXT (CHECK length(trim) > 0)
+    * comment : TEXT (NOT NULL, DEFAULT '')
+    * created_at : TIMESTAMPTZ
+    * updated_at : TIMESTAMPTZ
+    --
+    CHECK octet_length(comment) <= 1000
+    INDEX (user_id, created_at DESC)
+    INDEX (restaurant_id, status, created_at DESC)
+}
+
+entity "order_items" as order_items {
+    * id : UUID [PK, UUID v7 из приложения]
+    --
+    * order_id : UUID [FK -> orders.id, ON DELETE CASCADE]
+    * menu_item_id : UUID [FK -> menu_items.id, ON DELETE RESTRICT]
+    * item_name : VARCHAR(255)   <- снимок на момент заказа
+    * price_cents : BIGINT (CHECK >= 0)   <- снимок на момент заказа
+    * quantity : INT (CHECK > 0)
+    --
+    UNIQUE (order_id, menu_item_id)
+    INDEX (order_id)
+    INDEX (menu_item_id)
+}
+
+entity "order_status_history" as order_history {
+    * id : UUID [PK, UUID v7 из приложения]
+    --
+    * order_id : UUID [FK -> orders.id, ON DELETE CASCADE]
+    * from_status : VARCHAR(50) (пусто для первой записи)
+    * to_status : VARCHAR(50)
+    * actor : VARCHAR(32) (CHECK IN customer, restaurant, system)
+    * comment : TEXT (NOT NULL, DEFAULT '')
+    * created_at : TIMESTAMPTZ
+    --
+    CHECK octet_length(comment) <= 1000
+    INDEX (order_id, created_at ASC)
+}
+
+restaurants ||--o{ categories : "содержит"
+restaurants ||--o{ items : "содержит"
+categories ||--o{ items : "группирует (составной FK)"
+restaurants ||--o{ orders : "получает"
+orders ||--|{ order_items : "состоит из"
+items ||--o{ order_items : "снимок позиции"
+orders ||--|{ order_history : "история изменений"
+
+note bottom of items
+  Составной внешний ключ (restaurant_id, category_id) - ключевое решение схемы:
+  на уровне БД невозможно поместить блюдо в категорию чужого заведения,
+  даже в обход сервисного слоя.
+end note
+
+note bottom of order_items
+  Цена и название копируются в момент оформления.
+  Изменение меню не переписывает уже выданные чеки.
+end note
+@enduml
